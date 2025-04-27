@@ -1,1 +1,1 @@
-web: python -m dobby_forge.rizzy_agent
+web: python -m src.dobby_forge.rizzy_agent
