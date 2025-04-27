@@ -11,7 +11,8 @@ from sentient_agent_framework import (
     Query,
     ResponseHandler,
 )
-from src.dobby_forge.providers import ModelProvider
+
+from src.dobby_forge.providers.model_provider import ModelProvider
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -36,35 +37,29 @@ class DobbyAgentForge(AbstractAgent):
         self,
         session: Session,
         query: Query,
-        response_handler: ResponseHandler,
+        response_handler: ResponseHandler
     ):
-        # 1️⃣ PLAN
-        await response_handler.emit_text_block(
-            "PLAN",
-            "Interpreting your description and building your custom Dobby agent…"
-        )
+        """Main method to process the user query and generate agent output."""
+        final_response_stream = response_handler.create_text_stream("FINAL_RESPONSE")
 
-        raw = (query.prompt or "").strip()
-        # 2️⃣ Parse JSON or extract metadata
+        raw_prompt = (query.prompt or "").strip()
+
+        # Step 1️⃣: Parse the input
         try:
-            opts = json.loads(raw)
+            opts = json.loads(raw_prompt)
+            logger.info("Parsed structured JSON input successfully.")
         except json.JSONDecodeError:
-            await response_handler.emit_text_block(
-                "PLAN",
-                "Extracting agent parameters from your description…"
-            )
-            opts = await self.__extract_metadata(raw)
+            logger.info("Natural language input detected. Extracting metadata...")
+            opts = await self.__extract_metadata(raw_prompt)
 
-        # fill defaults
-        persona    = opts.get("persona", "").strip() or "Unhinged Freedom Enthusiast"
-        style      = opts.get("style",   "BLUNT").upper()
-        loyalty    = opts.get("loyalty", "STRICT").upper()
-        task       = opts.get("task",    "CODE").upper()    
-        temperature= float(opts.get("temperature", 0.7))
-        top_p      = float(opts.get("top_p",       0.9))
-        max_tokens = int(opts.get("max_tokens",   256))
-
-        agent_name = f"Dobby_{session.user_id[:8]}"
+        # Step 2️⃣: Fill defaults if missing
+        persona     = opts.get("persona", "Unhinged Freedom Enthusiast").strip()
+        style       = opts.get("style", "BLUNT").upper()
+        loyalty     = opts.get("loyalty", "STRICT").upper()
+        task        = opts.get("task", "CODE").upper()
+        temperature = float(opts.get("temperature", 0.7))
+        top_p       = float(opts.get("top_p", 0.9))
+        max_tokens  = int(opts.get("max_tokens", 256))
 
         directives = (
             f"[PERSONA={persona}]"
@@ -72,47 +67,55 @@ class DobbyAgentForge(AbstractAgent):
             f"[LOYALTY={loyalty}]"
             f"[TASK={task}]"
         )
-        if task == "SUMMARIZE":
-            instruction = "Summarize the content below in Dobby style:\n{content}"
-        elif task == "SOCIAL":
-            instruction = "Write a ready-to-post social media snippet (≤280 chars) in Dobby’s voice about:\n{content}"
-        else:  # CODE
+
+        # Step 3️⃣: Build dynamic instruction
+        if task == "CODE":
             instruction = (
-                f"Write a Python class named `{agent_name}` extending `AbstractAgent`. "
-                "Inside `assist()`, emit a single text block with the persona."
+                "Write a Python class named `DobbyAgents` extending `AbstractAgent`. "
+                "Inside `assist()`, emit a single text block that reflects the assigned persona's voice."
+            )
+        elif task == "SUMMARIZE":
+            instruction = "Summarize the content below in Dobby's style:\n{content}"
+        elif task == "SOCIAL":
+            instruction = (
+                "Write a ready-to-post social media snippet (≤280 chars) in Dobby’s voice about:\n{content}"
+            )
+        else:
+            logger.warning(f"Unknown task '{task}' provided. Defaulting to CODE generation.")
+            instruction = (
+                "Write a Python class named `DobbyAgents` extending `AbstractAgent`. "
+                "Inside `assist()`, emit a single text block that reflects the assigned persona's voice."
             )
 
-        user_prompt = f"{directives}\n{instruction}"
+        # Step 4️⃣: Combine system prompt, directives, and instruction
+        full_prompt = f"{SYSTEM_PROMPT}\n\n{directives}\n\n{instruction}"
 
-        # 4️⃣ Stream the generated agent code (or other output)
-        stream = response_handler.create_text_stream("CODE")
-        async for chunk in self.__process_task(
-            user_prompt,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-        ):
-            await stream.emit_chunk(chunk)
-        await stream.complete()
+        logger.info("Prompt construction complete. Starting streaming response...")
 
-        # 5️⃣ RESULT & COMPLETE
-        await response_handler.emit_text_block(
-            "RESULT",
-            f"✅ Your `{task}` agent **{agent_name}** is ready!"
-        )
-        await response_handler.emit_text_block("COMPLETE", "")
+        try:
+            async for chunk in self._model.query_stream(
+                full_prompt,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+            ):
+                await final_response_stream.emit_chunk(chunk)
+        except Exception as e:
+            logger.error(f"Error generating agent output: {str(e)}")
+            await final_response_stream.emit_chunk("Error generating response.")
+
+        await final_response_stream.complete()
         await response_handler.complete()
 
     async def __extract_metadata(self, description: str) -> dict:
         """
-        Ask the LLM to convert a natural-language description into a JSON
-        with keys: persona, style, loyalty, task, temperature, top_p, max_tokens.
+        Ask the LLM to infer metadata from a natural language description.
         """
         meta_prompt = (
             SYSTEM_PROMPT + "\n\n"
             "Extract the following fields from this description:\n"
             "  • persona (short phrase)\n"
-            "  • style (e.g. BLUNT, FRIENDLY)\n"
+            "  • style (e.g., BLUNT, FRIENDLY)\n"
             "  • loyalty (STRICT or NEUTRAL)\n"
             "  • task (CODE, SUMMARIZE, or SOCIAL)\n"
             "  • temperature (0.0–1.0)\n"
@@ -121,32 +124,14 @@ class DobbyAgentForge(AbstractAgent):
             f"Description: \"{description}\"\n\n"
             "Respond ONLY with valid JSON."
         )
-        resp = await self._model.query(meta_prompt)
         try:
-            return json.loads(resp)
-        except json.JSONDecodeError:
-            logger.warning("Metadata extraction failed, falling back to persona-only")
+            resp = await self._model.query(meta_prompt)
+            metadata = json.loads(resp)
+            logger.info(f"Metadata extracted: {metadata}")
+            return metadata
+        except Exception as e:
+            logger.warning(f"Metadata extraction failed, fallback to persona-only. Error: {str(e)}")
             return {"persona": description}
-
-    async def __process_task(
-        self,
-        prompt: str,
-        temperature: float,
-        top_p: float,
-        max_tokens: int,
-    ) -> AsyncIterator[str]:
-        """
-        Combine SYSTEM_PROMPT + user prompt, then stream chunks
-        from the model.
-        """
-        full_prompt = f"{SYSTEM_PROMPT}\n\n{prompt}"
-        async for chunk in self._model.query_stream(
-            full_prompt,
-            temperature=temperature,
-            top_p=top_p,
-            max_new_tokens=max_tokens,
-        ):
-            yield chunk
 
 
 if __name__ == "__main__":
